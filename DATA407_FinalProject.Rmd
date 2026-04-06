@@ -1,0 +1,584 @@
+---
+title: "Sentiment, Topics, and Emotional Patterns in AI Startup Reviews"
+author: "Salma Vikha Ainindita - DATA 407 Final Report"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Load Libraries
+
+```{r}
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(scales)
+```
+
+# Preprocessing
+
+```{r}
+db_path <- "./dataset/reviews.sqlite"
+doc_topics_path <- "./dataset/doc_topics_all_n30.csv"
+topic_summaries_path <- "./dataset/openai_topic_summaries.csv"
+
+con <- dbConnect(SQLite(), db_path)
+
+reviews_df <- dbGetQuery(con, "
+SELECT
+    review_pk,
+    review_id,
+    startup_id,
+    platform_id,
+    title,
+    content,
+    rating_original,
+    rating_scale_max,
+    rating_norm01,
+    review_date,
+    language,
+    country_code
+FROM reviews
+WHERE rating_original IS NOT NULL
+")
+
+vad_df <- dbGetQuery(con, "
+SELECT
+    review_pk,
+    valence,
+    arousal,
+    low_confidence,
+    coverage_review
+FROM review_vad_dominant_polarity
+")
+
+startups_df <- dbGetQuery(con, "
+SELECT
+    startup_id,
+    cluster
+FROM startups
+")
+
+dbDisconnect(con)
+
+doc_topics <- read_csv(doc_topics_path, show_col_types = FALSE)
+topic_summaries <- read_csv(topic_summaries_path, show_col_types = FALSE)
+
+topic_summaries_clean <- topic_summaries %>%
+  mutate(
+    clean_title = str_extract(summary, '(?<="title": ")[^"]+')
+  ) %>%
+  mutate(
+    topic_title = ifelse(is.na(clean_title), paste("Topic", topic_id), clean_title)
+  ) %>%
+  select(topic_id, topic_title)
+
+doc_topics_clean <- doc_topics %>%
+  filter(topic_id != -1) %>%
+  group_by(review_pk) %>%
+  slice_max(order_by = probability, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+master_df <- reviews_df %>%
+  left_join(vad_df, by = "review_pk") %>%
+  left_join(doc_topics_clean, by = "review_pk") %>%
+  left_join(topic_summaries_clean, by = "topic_id") %>%
+  left_join(startups_df, by = "startup_id") %>%
+  mutate(
+    sentiment = case_when(
+      rating_original < 3 ~ "negative",
+      rating_original == 3 ~ "neutral",
+      rating_original > 3 ~ "positive",
+      TRUE ~ NA_character_
+    ),
+    sentiment = factor(sentiment, levels = c("negative", "neutral", "positive")),
+    sentiment_score = case_when(
+      sentiment == "negative" ~ -1,
+      sentiment == "neutral" ~ 0,
+      sentiment == "positive" ~ 1,
+      TRUE ~ NA_real_
+    ),
+    is_positive = ifelse(sentiment == "positive", 1, 0),
+    is_negative = ifelse(sentiment == "negative", 1, 0),
+    is_neutral  = ifelse(sentiment == "neutral", 1, 0),
+    extreme_rating = ifelse(rating_original %in% c(1, 5), 1, 0)
+  )
+
+cat("Rows in master dataset:", nrow(master_df), "\n")
+cat("Rows with non-missing topic:", sum(!is.na(master_df$topic_title)), "\n")
+cat("Rows with non-missing cluster:", sum(!is.na(master_df$cluster)), "\n")
+cat("Rows with non-missing arousal:", sum(!is.na(master_df$arousal)), "\n")
+```
+
+# Research Questions
+
+1. **RQ1 (Sampling Bias in Reviews):** Does the overall positivity of AI reviews change after adjusting for startup-cluster imbalance?  
+2. **RQ2 (Topic Distribution and Satisfaction):** Do review topics vary across startup clusters, and are some topics associated with higher or lower satisfaction?  
+3. **RQ3 (Emotion Intensity vs Ratings):** Are extreme ratings (such as 1-star and 5-star reviews) associated with different arousal levels than non-extreme ratings?  
+
+# RQ1: Sampling Bias in Reviews
+
+```{r}
+rq1_df <- master_df %>%
+  filter(!is.na(sentiment), !is.na(cluster)) %>%
+  mutate(cluster = as.factor(cluster))
+
+cat("Rows used for RQ1:", nrow(rq1_df), "\n")
+cat("Clusters used:", n_distinct(rq1_df$cluster), "\n")
+```
+
+```{r}
+naive_sentiment <- rq1_df %>%
+  summarise(
+    n = n(),
+    positive_prop = mean(is_positive, na.rm = TRUE),
+    negative_prop = mean(is_negative, na.rm = TRUE),
+    neutral_prop  = mean(is_neutral, na.rm = TRUE)
+  )
+
+print(naive_sentiment)
+```
+
+```{r}
+cluster_satisfaction <- rq1_df %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    mean_satisfaction = mean(sentiment_score, na.rm = TRUE),
+    sd_satisfaction = sd(sentiment_score, na.rm = TRUE),
+    se_satisfaction = sd_satisfaction / sqrt(n),
+    positive_prop = mean(sentiment == "positive"),
+    negative_prop = mean(sentiment == "negative"),
+    neutral_prop = mean(sentiment == "neutral"),
+    var_positive_h = var(is_positive, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(cluster_satisfaction)
+```
+
+```{r}
+H <- n_distinct(cluster_satisfaction$cluster)
+
+cluster_satisfaction <- cluster_satisfaction %>%
+  mutate(W_h_equal = 1 / H)
+
+positive_stratified <- sum(cluster_satisfaction$W_h_equal * cluster_satisfaction$positive_prop, na.rm = TRUE)
+negative_stratified <- sum(cluster_satisfaction$W_h_equal * cluster_satisfaction$negative_prop, na.rm = TRUE)
+neutral_stratified  <- sum(cluster_satisfaction$W_h_equal * cluster_satisfaction$neutral_prop, na.rm = TRUE)
+
+comparison_df <- tibble(
+  estimate_type = c("naive", "stratified_equal_weight"),
+  positive_prop = c(naive_sentiment$positive_prop, positive_stratified),
+  negative_prop = c(naive_sentiment$negative_prop, negative_stratified),
+  neutral_prop  = c(naive_sentiment$neutral_prop, neutral_stratified)
+)
+
+print(comparison_df)
+```
+
+```{r}
+var_positive_stratified <- sum(
+  (cluster_satisfaction$W_h_equal^2) *
+    (cluster_satisfaction$var_positive_h / cluster_satisfaction$n),
+  na.rm = TRUE
+)
+
+se_positive_stratified <- sqrt(var_positive_stratified)
+
+stratified_precision <- tibble(
+  estimate = "positive_prop",
+  stratified_estimate = positive_stratified,
+  stratified_se = se_positive_stratified,
+  ci_lower = positive_stratified - 1.96 * se_positive_stratified,
+  ci_upper = positive_stratified + 1.96 * se_positive_stratified
+)
+
+print(stratified_precision)
+```
+
+```{r}
+bootstrap_compare <- function(data, B = 1000) {
+  n_rows <- nrow(data)
+  clusters <- unique(na.omit(data$cluster))
+  H <- length(clusters)
+
+  naive_vals <- numeric(B)
+  strat_vals <- numeric(B)
+
+  for (b in 1:B) {
+    boot_data <- data %>% slice_sample(n = n_rows, replace = TRUE)
+
+    naive_vals[b] <- mean(boot_data$is_positive, na.rm = TRUE)
+
+    stratum_boot <- boot_data %>%
+      filter(!is.na(cluster)) %>%
+      group_by(cluster) %>%
+      summarise(
+        positive_h = mean(is_positive, na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    stratum_boot <- tibble(cluster = clusters) %>%
+      left_join(stratum_boot, by = "cluster") %>%
+      mutate(
+        positive_h = ifelse(is.na(positive_h), 0, positive_h),
+        W_h = 1 / H
+      )
+
+    strat_vals[b] <- sum(stratum_boot$W_h * stratum_boot$positive_h, na.rm = TRUE)
+  }
+
+  tibble(
+    estimate_type = c("naive", "stratified_equal_weight"),
+    mean_estimate = c(mean(naive_vals), mean(strat_vals)),
+    ci_lower = c(quantile(naive_vals, 0.025), quantile(strat_vals, 0.025)),
+    ci_upper = c(quantile(naive_vals, 0.975), quantile(strat_vals, 0.975))
+  )
+}
+
+set.seed(123)
+bootstrap_summary <- bootstrap_compare(rq1_df, B = 1000)
+print(bootstrap_summary)
+```
+
+```{r}
+ggplot(
+  comparison_df,
+  aes(x = estimate_type, y = positive_prop)
+) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Naive vs Stratified Positive Review Estimate",
+    x = "Estimator",
+    y = "Positive Proportion"
+  )
+```
+
+```{r}
+cluster_sentiment_counts <- rq1_df %>%
+  count(cluster, sentiment) %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(
+  cluster_sentiment_counts,
+  aes(x = cluster, y = prop, fill = sentiment)
+) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Sentiment Composition by Startup Cluster",
+    x = "Startup Cluster",
+    y = "Proportion",
+    fill = "Sentiment"
+  )
+```
+
+## Conclusion
+
+The naive estimate suggests that **`r percent(naive_sentiment$positive_prop, accuracy = 0.1)`** of reviews are positive, while the equal-weight stratified estimate suggests **`r percent(positive_stratified, accuracy = 0.1)`**. The difference is **`r percent(abs(naive_sentiment$positive_prop - positive_stratified), accuracy = 0.1)`**. This shows that the overall positivity estimate changes depending on how startup clusters are weighted, so raw review summaries are sensitive to cluster imbalance.
+
+# RQ2: Topic Distribution and Satisfaction
+
+```{r}
+rq2_df <- master_df %>%
+  filter(!is.na(cluster), !is.na(topic_title), !is.na(sentiment), !is.na(sentiment_score)) %>%
+  mutate(cluster = as.factor(cluster),
+         topic_title = as.factor(topic_title))
+
+cat("Rows used for RQ2:", nrow(rq2_df), "\n")
+cat("Clusters used:", n_distinct(rq2_df$cluster), "\n")
+cat("Topics used:", n_distinct(rq2_df$topic_title), "\n")
+```
+
+```{r}
+topic_cluster_counts <- rq2_df %>%
+  count(cluster, topic_title) %>%
+  group_by(cluster) %>%
+  mutate(
+    cluster_total = sum(n),
+    prop = n / cluster_total
+  ) %>%
+  ungroup()
+
+print(topic_cluster_counts)
+```
+
+```{r}
+topic_cluster_table <- rq2_df %>%
+  count(cluster, topic_title) %>%
+  tidyr::pivot_wider(
+    names_from = topic_title,
+    values_from = n,
+    values_fill = 0
+  )
+
+topic_cluster_matrix <- topic_cluster_table %>%
+  select(-cluster) %>%
+  as.matrix()
+
+chi_topic_cluster <- chisq.test(topic_cluster_matrix)
+chi_topic_cluster
+```
+
+```{r}
+top_topics_by_cluster <- topic_cluster_counts %>%
+  group_by(cluster) %>%
+  slice_max(order_by = prop, n = 5, with_ties = FALSE) %>%
+  ungroup()
+
+print(top_topics_by_cluster)
+```
+
+```{r}
+bootstrap_mean_ci <- function(x, B = 1000) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  vals <- numeric(B)
+
+  for (b in 1:B) {
+    vals[b] <- mean(sample(x, size = n, replace = TRUE))
+  }
+
+  tibble(
+    mean_estimate = mean(vals),
+    ci_lower = quantile(vals, 0.025),
+    ci_upper = quantile(vals, 0.975)
+  )
+}
+
+topic_satisfaction <- rq2_df %>%
+  group_by(topic_title) %>%
+  summarise(
+    n = n(),
+    mean_satisfaction = mean(sentiment_score, na.rm = TRUE),
+    sd_satisfaction = sd(sentiment_score, na.rm = TRUE),
+    se_satisfaction = sd_satisfaction / sqrt(n),
+    positive_prop = mean(sentiment == "positive"),
+    negative_prop = mean(sentiment == "negative"),
+    neutral_prop = mean(sentiment == "neutral"),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_satisfaction))
+
+topic_satisfaction_boot <- rq2_df %>%
+  group_by(topic_title) %>%
+  summarise(
+    out = list(bootstrap_mean_ci(sentiment_score, B = 1000)),
+    .groups = "drop"
+  ) %>%
+  tidyr::unnest(out)
+
+topic_satisfaction_final <- topic_satisfaction %>%
+  left_join(
+    topic_satisfaction_boot %>%
+      select(topic_title, mean_estimate, ci_lower, ci_upper),
+    by = "topic_title"
+  )
+
+print(topic_satisfaction_final)
+```
+
+```{r}
+ggplot(
+  top_topics_by_cluster,
+  aes(x = fct_reorder(topic_title, prop), y = prop, fill = cluster)
+) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ cluster, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Top Topic Proportions Within Each Startup Cluster",
+    x = "Topic",
+    y = "Proportion"
+  )
+```
+
+```{r}
+ggplot(
+  topic_satisfaction_final,
+  aes(x = fct_reorder(topic_title, mean_satisfaction), y = mean_satisfaction)
+) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(
+    title = "Mean Satisfaction by Topic",
+    x = "Topic",
+    y = "Mean Satisfaction Score"
+  )
+```
+
+## Conclusion
+
+The chi-square test comparing topic distributions across startup clusters gives a p-value of **`r format.pval(chi_topic_cluster$p.value, digits = 3)`**. The topic with the highest mean satisfaction score is **`r as.character(topic_satisfaction_final$topic_title[which.max(topic_satisfaction_final$mean_satisfaction)])`**, while the topic with the lowest mean satisfaction score is **`r as.character(topic_satisfaction_final$topic_title[which.min(topic_satisfaction_final$mean_satisfaction)])`**. Together, these results show that startup clusters differ in the kinds of review topics they receive, and that review topics also differ meaningfully in their associated satisfaction levels.
+
+# RQ3: Emotion Intensity vs Ratings
+
+```{r}
+rq3_df <- master_df %>%
+  filter(!is.na(arousal), !is.na(rating_original), !is.na(extreme_rating))
+
+cat("Rows used for RQ3:", nrow(rq3_df), "\n")
+
+rq3_df_grouped <- rq3_df %>%
+  mutate(
+    rating_group = case_when(
+      rating_original < 2 ~ "very low (< 2)",
+      rating_original >= 2 & rating_original < 3 ~ "low [2, 3)",
+      rating_original == 3 ~ "neutral (3)",
+      rating_original > 3 & rating_original <= 4 ~ "high (3, 4]",
+      rating_original > 4 ~ "very high (> 4)",
+      TRUE ~ NA_character_
+    ),
+    rating_group = factor(
+      rating_group,
+      levels = c(
+        "very low (< 2)",
+        "low [2, 3)",
+        "neutral (3)",
+        "high (3, 4]",
+        "very high (> 4)"
+      )
+    )
+  ) %>%
+  filter(!is.na(rating_group))
+```
+
+```{r}
+rating_arousal_summary <- rq3_df_grouped %>%
+  group_by(rating_group) %>%
+  summarise(
+    n = n(),
+    mean_arousal = mean(arousal, na.rm = TRUE),
+    sd_arousal = sd(arousal, na.rm = TRUE),
+    se_arousal = sd_arousal / sqrt(n),
+    .groups = "drop"
+  )
+
+print(rating_arousal_summary)
+```
+
+```{r}
+extreme_summary <- rq3_df %>%
+  group_by(extreme_rating) %>%
+  summarise(
+    n = n(),
+    mean_arousal = mean(arousal, na.rm = TRUE),
+    sd_arousal = sd(arousal, na.rm = TRUE),
+    se_arousal = sd_arousal / sqrt(n),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    extreme_rating = ifelse(extreme_rating == 1, "extreme (1 or 5)", "non-extreme")
+  )
+
+print(extreme_summary)
+```
+
+```{r}
+bootstrap_mean_diff <- function(data, B = 1000) {
+  vals <- numeric(B)
+  n_rows <- nrow(data)
+
+  for (b in 1:B) {
+    boot_data <- data %>% slice_sample(n = n_rows, replace = TRUE)
+
+    mean_extreme <- mean(boot_data$arousal[boot_data$extreme_rating == 1], na.rm = TRUE)
+    mean_non_extreme <- mean(boot_data$arousal[boot_data$extreme_rating == 0], na.rm = TRUE)
+
+    vals[b] <- mean_extreme - mean_non_extreme
+  }
+
+  tibble(
+    mean_difference = mean(vals, na.rm = TRUE),
+    ci_lower = quantile(vals, 0.025, na.rm = TRUE),
+    ci_upper = quantile(vals, 0.975, na.rm = TRUE)
+  )
+}
+
+set.seed(123)
+diff_boot <- bootstrap_mean_diff(rq3_df, B = 1000)
+print(diff_boot)
+```
+
+```{r}
+t_test_result <- t.test(
+  arousal ~ extreme_rating,
+  data = rq3_df
+)
+
+t_test_result
+```
+
+```{r}
+ggplot(
+  extreme_summary,
+  aes(x = extreme_rating, y = mean_arousal, fill = extreme_rating)
+) +
+  geom_col() +
+  theme_minimal() +
+  labs(
+    title = "Mean Arousal: Extreme vs Non-Extreme Ratings",
+    x = "Rating Group",
+    y = "Mean Arousal"
+  )
+```
+
+```{r}
+ggplot(
+  rating_arousal_summary,
+  aes(x = rating_group, y = mean_arousal)
+) +
+  geom_point(size = 2) +
+  geom_errorbar(
+    aes(ymin = mean_arousal - 1.96 * se_arousal,
+        ymax = mean_arousal + 1.96 * se_arousal),
+    width = 0.2
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Mean Arousal by Rating Group",
+    x = "Rating Group",
+    y = "Mean Arousal"
+  )
+```
+
+## Conclusion
+
+The mean arousal for extreme ratings (1 or 5) is **`r round(extreme_summary$mean_arousal[extreme_summary$extreme_rating == "extreme (1 or 5)"], 3)`**, compared with **`r round(extreme_summary$mean_arousal[extreme_summary$extreme_rating == "non-extreme"], 3)`** for non-extreme ratings. The bootstrap estimate of the mean difference (extreme minus non-extreme) is **`r round(diff_boot$mean_difference, 3)`**, with a 95% bootstrap confidence interval of **[`r round(diff_boot$ci_lower, 3)`, `r round(diff_boot$ci_upper, 3)`]**. The two-sample t-test gives a p-value of **`r format.pval(t_test_result$p.value, digits = 3)`**. Together, these results indicate a statistically supported difference in average arousal level between extreme and non-extreme ratings, although both means remain close to zero overall.
+
+# Save Useful Outputs
+
+```{r}
+write_csv(master_df, "master_preprocessed_dataset.csv")
+
+write_csv(rq1_df, "rq1_sampling_bias_dataset.csv")
+write_csv(cluster_satisfaction, "rq1_cluster_satisfaction_summary.csv")
+write_csv(comparison_df, "rq1_naive_vs_stratified.csv")
+write_csv(bootstrap_summary, "rq1_bootstrap_summary.csv")
+
+write_csv(rq2_df, "rq2_topic_distribution_satisfaction_dataset.csv")
+write_csv(topic_cluster_counts, "rq2_topic_cluster_counts.csv")
+write_csv(topic_satisfaction_final, "rq2_topic_satisfaction_summary.csv")
+capture.output(chi_topic_cluster, file = "rq2_topic_cluster_chisq.txt")
+
+write_csv(rq3_df, "rq3_emotion_intensity_ratings_dataset.csv")
+write_csv(rating_arousal_summary, "rq3_rating_group_arousal_summary.csv")
+write_csv(extreme_summary, "rq3_extreme_rating_summary.csv")
+write_csv(diff_boot, "rq3_extreme_difference_bootstrap.csv")
+capture.output(t_test_result, file = "rq3_t_test_result.txt")
+```

@@ -3,8 +3,8 @@
 This repository contains the R Markdown source file and rendered HTML report for my DATA 407 project on AI startup reviews.
 
 ## Files
-- `data407_final_3rqs.Rmd` — main R Markdown report
-- `data407_final_3rqs.html` — rendered HTML output
+- `DATA407_FinalProject.Rmd` — main R Markdown report
+- `DATA407_FinalProject.html` — rendered HTML output
 
 ## Project Focus
 The report examines three questions:
